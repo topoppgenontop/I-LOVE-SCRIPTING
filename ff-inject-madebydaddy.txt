@@ -1,0 +1,653 @@
+local normalizeName = function(name)
+    if not name then
+        return ""
+    end
+    local head = name:sub(1, 2)
+    if head ~= "DF" and head ~= "FF" and head ~= "FI" and head ~= "FS" then
+        return name
+    end
+    return name
+        :gsub("^DFInt", "")
+        :gsub("^DFFlag", "")
+        :gsub("^FFlag", "")
+        :gsub("^FInt", "")
+        :gsub("^DFString", "")
+        :gsub("^FString", "")
+end
+
+local function buildVariants(canonical, original)
+    local seen = {}
+    local out = {}
+
+    local function push(s)
+        if s and s ~= "" and not seen[s] then
+            seen[s] = true
+            out[#out + 1] = s
+        end
+    end
+
+    push(original)
+
+    local base = canonical
+    if base and base ~= "" and not seen[base] then
+        seen[base] = true
+        out[#out + 1] = base
+    end
+
+    if base and not base:match("^FFlag") and not base:match("^DF") and not base:match("^FI") then
+        push("FFlag" .. base)
+        push("DFFlag" .. base)
+        push("DFInt" .. base)
+        push("FInt" .. base)
+    end
+
+    return out
+end
+
+local priorityKeywords = {
+    "telemetry", "analytics", "crash", "taskscheduler", "targetfps", "frm",
+    "fps", "ping", "network", "raknet", "physics", "unlock240", "variablemaxfps"
+}
+
+local function priorityOf(name)
+    local lower = name:lower()
+    for i, kw in ipairs(priorityKeywords) do
+        if lower:find(kw, 1, true) then
+            return i
+        end
+    end
+    return 50
+end
+
+local function uniqueAndSort(queue)
+    local byName = {}
+    local seen = {}
+    local ordered = {}
+
+    for _, entry in ipairs(queue) do
+        if not seen[entry[1]] then
+            seen[entry[1]] = true
+            ordered[#ordered + 1] = entry
+        end
+    end
+
+    table.sort(ordered, function(a, b)
+        local pa = priorityOf(a[1])
+        local pb = priorityOf(b[1])
+        if pa ~= pb then
+            return pa < pb
+        end
+        return a[1] < b[1]
+    end)
+
+    for _, e in ipairs(ordered) do
+        byName[e[1]] = e
+    end
+
+    return ordered, byName
+end
+
+local function callSetFlag(name, valueStr)
+    local str = tostring(valueStr)
+    local setters = {
+        setfflag, set_fflag, setfastflag, set_fast_flag, setfastflagforall
+    }
+
+    if getgenv then
+        local g = getgenv()
+        table.insert(setters, g.setfflag)
+        table.insert(setters, g.set_fflag)
+        table.insert(setters, g.setfastflag)
+        table.insert(setters, g.set_fast_flag)
+    end
+
+    for _, setter in ipairs(setters) do
+        if type(setter) == "function" then
+            local ok = pcall(function()
+                setter(name, str)
+            end)
+            if ok then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function getflag()
+    if getfflag then return getfflag end
+    if get_fflag then return get_fflag end
+    if getgenv then
+        local g = getgenv()
+        if g.getfflag then return g.getfflag end
+        if g.get_fflag then return g.get_fflag end
+    end
+    return nil
+end
+
+local function readFlag(canonical)
+    local variants = buildVariants(canonical, canonical)
+    local gf = getflag()
+    if not gf then
+        return nil
+    end
+    for _, v in ipairs(variants) do
+        local ok, val = pcall(function()
+            return gf(v)
+        end)
+        if ok and val ~= nil then
+            return val
+        end
+    end
+    return nil
+end
+
+local function valuesMatch(a, b)
+    if a == nil or b == nil then
+        return false
+    end
+    if tostring(a):lower() == tostring(b):lower() then
+        return true
+    end
+    local na, nb = tonumber(a), tonumber(b)
+    return na ~= nil and nb ~= nil and na == nb
+end
+
+local function parseJsonToCatalog(text)
+    local catalog = {}
+
+    if not text or text == "" then
+        return catalog
+    end
+
+    local function add(name, value)
+        if not name or name == "" then
+            return
+        end
+        if name:match("MacPlayer") or name:match("WindowsPlayer") then
+            return
+        end
+        if value == nil or value == "" or value == "null" then
+            return
+        end
+        local clean = normalizeName(name)
+        local val = value
+        if type(val) == "string" then
+            local low = val:lower()
+            if low == "true" then
+                val = "True"
+            elseif low == "false" then
+                val = "False"
+            end
+        end
+        catalog[clean] = { val = val, orig = name }
+    end
+
+    for name, val in text:gmatch('"(.-)"%s*:%s*"(.-)"') do
+        add(name, val)
+    end
+
+    for name, val in text:gmatch('"(.-)"%s*:%s*(%d+)') do
+        add(name, tonumber(val))
+    end
+
+    for name in text:gmatch('"(.-)"%s*:%s*(true)') do
+        add(name, "True")
+    end
+
+    for name in text:gmatch('"(.-)"%s*:%s*(false)') do
+        add(name, "False")
+    end
+
+    return catalog
+end
+
+local function pacing(count)
+    local p = {
+        drip_wait = 0.008,
+        variant_wait = 0.004,
+        batch_every = 0,
+        batch_pause = 0,
+        batch_frames = 0,
+        verify_limit = 28,
+        retry_limit = 12,
+        log_each_custom = true
+    }
+    if count >= 500 then
+        p.drip_wait = 0.018
+        p.variant_wait = 0.003
+        p.batch_every = 24
+        p.batch_pause = 0.14
+        p.batch_frames = 2
+        p.verify_limit = 16
+        p.retry_limit = 10
+        p.log_each_custom = false
+    elseif count >= 300 then
+        p.drip_wait = 0.014
+        p.batch_every = 32
+        p.batch_pause = 0.11
+        p.batch_frames = 1
+        p.verify_limit = 20
+    elseif count >= 150 then
+        p.drip_wait = 0.012
+        p.batch_every = 50
+        p.batch_pause = 0.08
+    elseif count >= 80 then
+        p.drip_wait = 0.01
+    end
+    return p
+end
+
+local function applySideEffect(name, val)
+    local low = tostring(val):lower()
+    local isOn = low == "true" or low == "1" or low == "on"
+    local num = tonumber(val)
+
+    pcall(function()
+        local RenderSettings = settings():GetService("RenderSettings")
+        if name == "DebugFRMQualityLevelOverride" and num then
+            RenderSettings.EditQualityLevel = num
+            RenderSettings.QualityLevel = num
+        end
+    end)
+    pcall(function()
+        if name == "DebugForceDisableShadows" then
+            game:GetService("Lighting").GlobalShadows = not isOn
+        end
+    end)
+    pcall(function()
+        if name == "RenderShadowIntensity" and num then
+            game:GetService("Lighting").ShadowSoftness = num
+        end
+    end)
+    pcall(function()
+        if name == "RenderGrassHeightScaler" and num then
+            workspace.GrassLength = num
+        end
+    end)
+end
+
+local function injectOne(name, val, orig, variantWait)
+    local w = variantWait or 0.004
+    local variants = buildVariants(name, orig)
+    local okAny = false
+    for i, v in ipairs(variants) do
+        if callSetFlag(v, tostring(val)) then
+            okAny = true
+        end
+        if w > 0 and i < #variants then
+            task.wait(w)
+        end
+    end
+    applySideEffect(name, val)
+    return okAny
+end
+
+local activeOverrides = {}
+local hookInstalled = false
+
+local function installGetFflagHook()
+    if hookInstalled then
+        return
+    end
+
+    local gf = getflag()
+    if not gf or not hookfunction or not get_module_base then
+        return
+    end
+
+    local base
+    for _, libname in ipairs({ "libroblox.so", "lib_roblox.so", "lib_roblox_vng.so", "librbx.so" }) do
+        local ok, addr = pcall(function()
+            return get_module_base(libname)
+        end)
+        if ok and addr and addr ~= 0 then
+            base = addr
+            break
+        end
+    end
+
+    if not base then
+        return
+    end
+
+    local target = base + 40395740
+
+    local ok = pcall(function()
+        hookfunction(target, function(flagArg, ...)
+            local s = ""
+            pcall(function()
+                if type(flagArg) == "string" then
+                    s = flagArg
+                elseif readstring then
+                    s = readstring(flagArg)
+                else
+                    s = tostring(flagArg)
+                end
+            end)
+
+            if s ~= "" then
+                local clean = normalizeName(s)
+                local override = activeOverrides[clean]
+                if override ~= nil then
+                    local low = tostring(override):lower()
+                    if low == "true" then
+                        return true
+                    elseif low == "false" then
+                        return false
+                    end
+                    local num = tonumber(override)
+                    if num ~= nil then
+                        return num
+                    end
+                end
+            end
+
+            return (nil)(flagArg, ...)
+        end)
+    end)
+
+    if ok then
+        hookInstalled = true
+    end
+end
+
+local function runInjectAll(jsonText, onProgress)
+    local catalog = parseJsonToCatalog(jsonText)
+
+    if type(onProgress) ~= "function" then
+        onProgress = nil
+    end
+
+    if next(catalog) == nil then
+        warn("[FastFlags] No valid flags parsed from JSON.")
+        return false, 0
+    end
+
+    installGetFflagHook()
+
+    local queue = {}
+    local nCustom = 0
+
+    for clean, entry in pairs(catalog) do
+        queue[#queue + 1] = { clean, tostring(entry.val), entry.orig, true }
+        activeOverrides[clean] = entry.val
+        nCustom = nCustom + 1
+    end
+
+    local ordered = uniqueAndSort(queue)
+    local total = #ordered
+    local p = pacing(total)
+
+    local applied = 0
+    local failed = 0
+
+    for idx, entry in ipairs(ordered) do
+        local name, val, orig = entry[1], entry[2], entry[3]
+
+        if not injectOne(name, val, orig, p.variant_wait) then
+            failed = failed + 1
+        end
+
+        task.wait(p.drip_wait)
+        applied = applied + 1
+
+        if onProgress then
+            onProgress(applied, total)
+        end
+
+        if p.batch_every > 0 and applied % p.batch_every == 0 then
+            task.wait(p.batch_pause)
+            if p.batch_frames > 0 then
+                local RunService = game:GetService("RunService")
+                for _ = 1, p.batch_frames do
+                    RunService.Heartbeat:Wait()
+                end
+            end
+        end
+    end
+
+    local gf = getflag()
+    if gf then
+        local checked, verified, bad = 0, 0, {}
+        for clean, entry in pairs(catalog) do
+            if checked >= p.verify_limit then
+                break
+            end
+            local current = readFlag(clean)
+            if current ~= nil then
+                checked = checked + 1
+                if valuesMatch(current, entry.val) then
+                    verified = verified + 1
+                else
+                    bad[#bad + 1] = clean
+                end
+            end
+        end
+
+        if #bad > 0 then
+            local retryN = math.min(#bad, p.retry_limit)
+            for i = 1, retryN do
+                local clean = bad[i]
+                local entry = catalog[clean]
+                if entry then
+                    injectOne(clean, tostring(entry.val), entry.orig, p.variant_wait)
+                    task.wait(math.max(p.drip_wait, 0.012))
+                end
+            end
+        end
+    end
+
+    warn(string.format("[FastFlags] Injected %d flags (verified via getfflag).", applied))
+    return true, applied
+end
+
+local function makeDraggable(uiElement, dragHandle, onClick)
+    local UserInputService = game:GetService("UserInputService")
+    local dragging = false
+    local movement = nil
+    local startPos = nil
+    local elemStartPos = nil
+    local dragDistance = 0
+
+    dragHandle.InputBegan:Connect(function(input)
+        local isDrag = input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+
+        if isDrag then
+            dragging = true
+            startPos = input.Position
+            elemStartPos = uiElement.Position
+            dragDistance = 0
+        end
+    end)
+
+    dragHandle.InputChanged:Connect(function(input)
+        local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch
+
+        if isMove then
+            movement = input
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input == movement and dragging then
+            dragging = false
+            movement = nil
+
+            if dragDistance < 5 and onClick then
+                onClick()
+            end
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == movement and dragging then
+            local delta = input.Position - startPos
+            dragDistance = dragDistance + delta.Magnitude
+            uiElement.Position = UDim2.new(
+                elemStartPos.X.Scale,
+                elemStartPos.X.Offset + delta.X,
+                elemStartPos.Y.Scale,
+                elemStartPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+local function buildGui(injectFn)
+    local LocalPlayer = game:GetService("Players").LocalPlayer
+    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "FastFlagsInjector"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local RootScale = Instance.new("UIScale")
+    RootScale.Scale = 0.5
+    RootScale.Parent = ScreenGui
+    ScreenGui.Parent = PlayerGui
+
+    local accent = Color3.fromRGB(16, 132, 215)
+    local bg = Color3.new(0, 0, 0)
+    local card = Color3.fromRGB(46, 46, 46)
+    local border = Color3.fromRGB(60, 60, 60)
+    local text = Color3.fromRGB(255, 255, 255)
+    local muted = Color3.fromRGB(160, 160, 160)
+    local terminal = Color3.fromRGB(122, 232, 255)
+
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0, 340, 0, 240)
+    Frame.Position = UDim2.new(0, 16, 0, 16)
+    Frame.BackgroundColor3 = bg
+    Frame.BorderSizePixel = 0
+    Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 8)
+    local Stroke = Instance.new("UIStroke", Frame)
+    Stroke.Color = border
+    Stroke.Thickness = 1
+    Frame.Parent = ScreenGui
+
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, -16, 0, 24)
+    Title.Position = UDim2.new(0, 8, 0, 8)
+    Title.BackgroundTransparency = 1
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 15
+    Title.TextColor3 = text
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    Title.Text = "FastFlags Injector"
+    Title.Parent = Frame
+
+    local Box = Instance.new("TextBox")
+    Box.Size = UDim2.new(1, -16, 1, -92)
+    Box.Position = UDim2.new(0, 8, 0, 36)
+    Box.BackgroundColor3 = card
+    Box.BorderSizePixel = 0
+    Box.PlaceholderText = "Paste FastFlags JSON here..."
+    Box.PlaceholderColor3 = muted
+    Box.TextColor3 = terminal
+    Box.Font = Enum.Font.RobotoMono
+    Box.TextSize = 12
+    Box.ClearTextOnFocus = false
+    Box.MultiLine = true
+    Box.TextWrapped = true
+    Box.TextXAlignment = Enum.TextXAlignment.Left
+    Box.TextYAlignment = Enum.TextYAlignment.Top
+    Box.Text = ""
+    Instance.new("UICorner", Box).CornerRadius = UDim.new(0, 6)
+    local BoxStroke = Instance.new("UIStroke", Box)
+    BoxStroke.Color = border
+    BoxStroke.Thickness = 1
+    Box.Parent = Frame
+
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, -16, 0, 14)
+    status.Position = UDim2.new(0, 8, 1, -52)
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.RobotoMono
+    status.TextSize = 11
+    status.TextColor3 = muted
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Text = "Ready"
+    status.Parent = Frame
+
+    local InjectBtn = Instance.new("TextButton")
+    InjectBtn.Size = UDim2.new(1, -16, 0, 32)
+    InjectBtn.Position = UDim2.new(0, 8, 1, -36)
+    InjectBtn.BackgroundColor3 = accent
+    InjectBtn.BorderSizePixel = 0
+    InjectBtn.Font = Enum.Font.GothamBold
+    InjectBtn.TextSize = 14
+    InjectBtn.TextColor3 = Color3.new(1, 1, 1)
+    InjectBtn.Text = "INJECT ALL"
+    Instance.new("UICorner", InjectBtn).CornerRadius = UDim.new(0, 6)
+    InjectBtn.Parent = Frame
+
+    local InjectStroke = Instance.new("UIStroke")
+    InjectStroke.Color = accent
+    InjectStroke.Thickness = 1.5
+    InjectStroke.Parent = InjectBtn
+
+    local baseBtnSize = InjectBtn.Size
+    local TweenService = game:GetService("TweenService")
+
+    local function hex(h)
+        return Color3.fromHSV(h, 1, 1)
+    end
+
+    local hue = 0
+
+    game:GetService("RunService").RenderStepped:Connect(function(dt)
+        hue = (hue + dt * 0.35) % 1
+        local c = hex(hue)
+        InjectBtn.BackgroundColor3 = c
+        InjectStroke.Color = c
+        Stroke.Color = c
+        Title.TextColor3 = c
+    end)
+
+    InjectBtn.MouseButton1Click:Connect(function()
+        TweenService:Create(InjectBtn, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = UDim2.new(1, -16, 0, 40) }):Play()
+        InjectBtn.Text = "INJECTING..."
+        status.Text = "Injecting..."
+        task.spawn(function()
+            local ok, count = injectFn(Box.Text, function(applied, total)
+                InjectBtn.Text = "INJECTING... " .. tostring(applied) .. "/" .. tostring(total)
+                status.Text = "Injecting " .. tostring(applied) .. "/" .. tostring(total)
+            end)
+            if ok then
+                status.Text = "Injected " .. tostring(count) .. " flags"
+            else
+                status.Text = "No flags parsed"
+            end
+            InjectBtn.Text = "INJECT ALL"
+            TweenService:Create(InjectBtn, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = baseBtnSize }):Play()
+            task.delay(3.8, function()
+                pcall(function()
+                    ScreenGui:Destroy()
+                end)
+            end)
+        end)
+    end)
+
+    makeDraggable(Frame, Frame)
+
+    return ScreenGui
+end
+
+task.spawn(function()
+    if not game:IsLoaded() then
+        game.Loaded:Wait()
+    end
+
+    local LocalPlayer = game:GetService("Players").LocalPlayer
+    while not LocalPlayer do
+        task.wait(0.1)
+        LocalPlayer = game:GetService("Players").LocalPlayer
+    end
+
+    buildGui(runInjectAll)
+end)
